@@ -12,6 +12,7 @@ once rewrote a real developer's configuration.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -190,11 +191,18 @@ def test_dry_run_on_a_missing_file_creates_nothing(settings: Path) -> None:
 
 
 def test_hook_command_is_absolute() -> None:
-    """A bare name relies on a GUI-launched editor inheriting the right
-    PATH, which is exactly what breaks for pipx and venv installs."""
+    r"""A bare name relies on a GUI-launched editor inheriting the right
+    PATH, which is exactly what breaks for pipx and venv installs.
+
+    Absoluteness is checked with ``os.path.isabs`` rather than a leading
+    "/" — on Windows the resolved path is ``C:\...\pkgpatrol.EXE``, which
+    an earlier Unix-shaped assertion rejected even though the code was
+    behaving correctly.
+    """
     command = hook_command()
     assert command.endswith(" hook")
-    assert command.startswith("/") or "python" in command
+    executable = command[: -len(" hook")]
+    assert os.path.isabs(executable.split(" -m ")[0]), executable
 
 
 def test_explicit_executable_is_used() -> None:
