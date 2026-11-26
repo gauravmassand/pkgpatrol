@@ -247,9 +247,24 @@ def test_auto_approve_modes_are_detected(mode: str) -> None:
     assert HookInput.from_json(payload("npm i x", mode=mode)).is_auto_approving
 
 
-@pytest.mark.parametrize("mode", ["default", "plan", "", "unknown"])
-def test_normal_modes_are_not_auto_approving(mode: str) -> None:
+@pytest.mark.parametrize("mode", ["default", "plan", "", "ask"])
+def test_interactive_modes_are_not_auto_approving(mode: str) -> None:
     assert not HookInput.from_json(payload("npm i x", mode=mode)).is_auto_approving
+
+
+def test_auto_mode_is_auto_approving() -> None:
+    """Regression: a live session reported `permission_mode: "auto"`, which the
+    original hard-coded set missed. In auto mode nothing prompts, so an `ask`
+    decision would be silently discarded and a real finding lost."""
+    assert HookInput.from_json(payload("npm i x", mode="auto")).is_auto_approving
+
+
+@pytest.mark.parametrize("mode", ["yolo", "someFutureMode", "AUTO", "bypass"])
+def test_unknown_modes_are_treated_as_auto_approving(mode: str) -> None:
+    """The mode vocabulary is not ours to control, and the two errors are not
+    symmetrical: wrongly assuming a prompt reaches the user swallows a real
+    finding, while the opposite only costs a `deny` the user can override."""
+    assert HookInput.from_json(payload("npm i x", mode=mode)).is_auto_approving
 
 
 # ---------------------------------------------------------------------------
