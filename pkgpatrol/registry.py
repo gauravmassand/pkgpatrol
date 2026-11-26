@@ -224,8 +224,14 @@ def _npm_metadata_url(name: str, spec: str | None) -> tuple[str, Resolution]:
     return f"{NPM_REGISTRY}/{quoted}/latest", Resolution.LATEST
 
 
+#: Statuses that mean "no such package", not "something went wrong". npm
+#: answers 405 for a malformed name rather than 404, which once let
+#: `check 'not a valid name'` report as merely lacking a repository.
+_NO_SUCH_PACKAGE = frozenset({400, 404, 405})
+
+
 def _apply_npm_metadata(facts: PackageFacts, response: Response) -> PackageFacts:
-    if response.missing:
+    if response.status in _NO_SUCH_PACKAGE:
         return replace(facts, exists=False, resolution=Resolution.UNRESOLVED)
     if not response.ok:
         if response.unreachable:
@@ -294,7 +300,7 @@ def _pypi_metadata_url(name: str, spec: str | None) -> tuple[str, Resolution]:
 
 
 def _apply_pypi_metadata(facts: PackageFacts, response: Response) -> PackageFacts:
-    if response.missing:
+    if response.status in _NO_SUCH_PACKAGE:
         return replace(facts, exists=False, resolution=Resolution.UNRESOLVED)
     if not response.ok:
         if response.unreachable:

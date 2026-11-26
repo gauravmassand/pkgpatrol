@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pkgpatrol"
-version = "0.1.0"
+version = "0.2.0"
 description = "Vet npm and PyPI packages for supply-chain red flags before they install — as a Claude Code PreToolUse hook or a standalone CLI."
 readme = "README.md"
 requires-python = ">=3.10"

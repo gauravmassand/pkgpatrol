@@ -316,3 +316,18 @@ def test_default_policy_is_shared_and_frozen() -> None:
     # thresholds for every other caller in the process.
     with pytest.raises(dataclasses.FrozenInstanceError):
         DEFAULT_POLICY.new_version_days = 1  # type: ignore[misc]
+
+
+def test_unresolved_version_is_never_silent() -> None:
+    """Regression: a registry that answered but yielded no version left every
+    other rule reading absent fields, so the report said "declares no source
+    repository" — which reads as "checked and basically fine"."""
+    found = analyze(facts(resolved_version=None, repository=None, errors=("HTTP 500",)))
+    assert codes(found) == {"unresolved"}
+    assert found[0].severity is Severity.MEDIUM
+    assert "nothing about this package was verified" in found[0].detail
+
+
+def test_unresolved_mentions_the_underlying_error() -> None:
+    found = analyze(facts(resolved_version=None, errors=("HTTP 500",)))
+    assert "HTTP 500" in found[0].detail
