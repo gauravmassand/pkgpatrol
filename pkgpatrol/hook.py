@@ -61,7 +61,18 @@ __all__ = [
 #: modes an `ask` decision is useless — nothing will prompt — so a genuine
 #: finding has to escalate to `deny` to have any effect. This is what "work
 #: even in auto-approve/yolo mode" means in practice.
-AUTO_APPROVE_MODES = frozenset({"bypassPermissions", "acceptEdits"})
+#:
+#: `auto` was found by logging real payloads, not from documentation: a live
+#: session reported `permission_mode: "auto"`, which this set originally
+#: missed. Since the list is discovered rather than specified, treat any
+#: unrecognized mode conservatively via :func:`is_auto_approving` instead of
+#: assuming prompts will reach the user.
+AUTO_APPROVE_MODES = frozenset(
+    {"auto", "bypassPermissions", "acceptEdits", "dangerouslySkipPermissions"}
+)
+
+#: Modes known to still prompt the user, where `ask` is meaningful.
+INTERACTIVE_MODES = frozenset({"default", "plan", "ask", ""})
 
 #: We only inspect Bash commands; every other tool is irrelevant to us.
 WATCHED_TOOL = "Bash"
@@ -117,8 +128,15 @@ class HookInput:
 
     @property
     def is_auto_approving(self) -> bool:
-        """True when per-call prompts are suppressed, so `ask` would be a no-op."""
-        return self.permission_mode in AUTO_APPROVE_MODES
+        """True when per-call prompts are suppressed, so `ask` would be a no-op.
+
+        Unknown modes count as auto-approving. The mode vocabulary is not
+        something we control, and the two mistakes are not symmetrical: if we
+        wrongly assume a prompt will reach the user, a real finding gets
+        swallowed and the install proceeds unchallenged. Assuming the opposite
+        only costs a `deny` the user can override.
+        """
+        return self.permission_mode not in INTERACTIVE_MODES
 
 
 def _as_str(value: Any) -> str:
