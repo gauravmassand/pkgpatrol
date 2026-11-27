@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from enum import IntEnum
 
 from .registry import PackageFacts, Resolution
+from .typosquat import check_name
 
 __all__ = [
     "Severity",
@@ -247,6 +248,33 @@ def _repository_finding(facts: PackageFacts) -> Finding | None:
     )
 
 
+def _typosquat_finding(facts: PackageFacts) -> Finding | None:
+    """Flag a name that imitates a popular package.
+
+    Severity depends on whether the name exists. A *nonexistent* lookalike is
+    already CRITICAL via ``not-found``, so this adds detail there. An existing
+    lookalike with few users is the dangerous case: somebody registered it.
+    """
+    imitation = check_name(
+        facts.name,
+        facts.ecosystem,
+        weekly_downloads=facts.weekly_downloads,
+        exists=facts.exists,
+    )
+    if imitation is None:
+        return None
+    return Finding(
+        code="typosquat",
+        severity=Severity.HIGH,
+        summary=f"{facts.name} closely resembles {imitation.target}",
+        detail=(
+            f"{imitation.summary}. Typosquats rely on a misread name, and an "
+            f"agent that guessed a package is as likely to misread one as a "
+            f"human is."
+        ),
+    )
+
+
 def _resolution_finding(facts: PackageFacts) -> Finding | None:
     if facts.resolution is not Resolution.RANGE:
         return None
@@ -277,9 +305,32 @@ def analyze(facts: PackageFacts, policy: Policy = DEFAULT_POLICY) -> list[Findin
     if not facts.exists:
         # Every other rule would be describing fields a nonexistent package
         # cannot have. "Declares no source repository" is true but vacuous,
-        # and padding a critical finding with noise weakens it.
-        missing = _missing_finding(facts)
-        return [missing] if missing else []
+        # and padding a critical finding with noise weakens it. The one
+        # exception is a lookalike name: knowing *what* it resembles turns
+        # "this does not exist" into "you probably meant requests".
+        found = [item for item in (_missing_finding(facts),) if item]
+        imitation = _typosquat_finding(facts)
+        if imitation is not None:
+            found.append(imitation)
+        return found
+
+    if facts.resolved_version is None:
+        # We reached the registry but came away with no version, so every
+        # other rule would be reading absent fields and reporting their
+        # absence as if it were a property of the package. Silence here
+        # would read as "checked and clean", which it is not.
+        return [
+            Finding(
+                code="unresolved",
+                severity=Severity.MEDIUM,
+                summary=f"could not determine a version for {facts.name}",
+                detail=(
+                    "The registry answered but gave us no usable version, so "
+                    "nothing about this package was verified."
+                    + (f" ({'; '.join(facts.errors)})" if facts.errors else "")
+                ),
+            )
+        ]
 
     candidates = [
         _missing_finding(facts),
@@ -287,6 +338,7 @@ def analyze(facts: PackageFacts, policy: Policy = DEFAULT_POLICY) -> list[Findin
         _yanked_finding(facts),
         _deprecated_finding(facts),
         _install_script_finding(facts),
+        _typosquat_finding(facts),
         _freshness_finding(facts, policy),
         _downloads_finding(facts, policy),
         _maintainer_finding(facts, policy),

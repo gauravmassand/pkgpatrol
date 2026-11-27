@@ -468,3 +468,24 @@ def test_display_includes_resolved_version() -> None:
 
 def test_display_falls_back_to_name() -> None:
     assert PackageFacts(name="x", ecosystem=Ecosystem.NPM).display == "x"
+
+
+@pytest.mark.parametrize("status", [400, 404, 405])
+def test_registry_rejecting_the_name_means_it_does_not_exist(status: int) -> None:
+    """Regression: npm answers 405 for a malformed name, not 404. Checking
+    only for 404 left `exists=True` with no version, and the package was
+    reported as merely lacking a source repository."""
+    client = StubClient(
+        {"/express/latest": Response(url="x", status=status, error=f"HTTP {status}")}
+    )
+    facts = fetch_facts(npm(), client)
+    assert facts.exists is False
+    assert facts.unreachable is False
+
+
+@pytest.mark.parametrize("status", [400, 404, 405])
+def test_pypi_rejecting_the_name_means_it_does_not_exist(status: int) -> None:
+    client = StubClient(
+        {"/requests/json": Response(url="x", status=status, error=f"HTTP {status}")}
+    )
+    assert fetch_facts(pypi(), client).exists is False

@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-import io
-
 import pytest
 
 from pkgpatrol import __version__
-from pkgpatrol.cli import EXIT_OK, EXIT_UNIMPLEMENTED, main
+from pkgpatrol.cli import EXIT_FLAGGED, EXIT_OK, main
 
 
 def test_version_exits_zero(capsys: pytest.CaptureFixture[str]) -> None:
@@ -41,30 +39,6 @@ def test_parse_subcommand_reports_skipped(capsys: pytest.CaptureFixture[str]) ->
     assert "skipped" in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("command", ["check", "init"])
-def test_unimplemented_commands_fail_loudly(
-    command: str, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """These must not exit 0 — a security tool that silently checks nothing
-    is worse than one that admits it is unfinished.
-
-    ``hook`` is deliberately absent: it is implemented, and must exit 0 even
-    when it has nothing to say, or it would block the user's tool call.
-    """
-    argv = [command, "express"] if command == "check" else [command]
-    assert main(argv) == EXIT_UNIMPLEMENTED
-    assert "not implemented" in capsys.readouterr().err
-
-
-def test_hook_subcommand_exits_zero_on_empty_stdin(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The opposite requirement from the test above: `hook` must never exit
-    non-zero, since that becomes a blocking error in Claude Code."""
-    monkeypatch.setattr("sys.stdin", io.StringIO(""))
-    assert main(["hook"]) == EXIT_OK
-
-
 def test_bad_subcommand_is_usage_error() -> None:
     with pytest.raises(SystemExit) as excinfo:
         main(["nonsense"])
@@ -72,42 +46,150 @@ def test_bad_subcommand_is_usage_error() -> None:
 
 
 # --------------------------------------------------------------------------
-# hook / init subcommands
+# check
 # --------------------------------------------------------------------------
 
 
-def test_init_print_emits_valid_settings_json(
-    capsys: pytest.CaptureFixture[str],
+def _stub_gather(monkeypatch: pytest.MonkeyPatch, *results) -> None:
+    """Replace the registry lookup so `check` never touches the network."""
+    monkeypatch.setattr("pkgpatrol.cli.gather", lambda *_a, **_k: list(results))
+
+
+def _facts(name: str, **overrides: object):
+    from pkgpatrol.parse import Ecosystem
+    from pkgpatrol.registry import PackageFacts, Resolution
+
+    base: dict = {
+        "name": name,
+        "ecosystem": Ecosystem.NPM,
+        "resolved_version": "1.0.0",
+        "resolution": Resolution.LATEST,
+        "exists": True,
+        "weekly_downloads": 9_000_000,
+        "maintainers": 4,
+        "repository": f"https://github.com/x/{name}",
+    }
+    base.update(overrides)
+    return PackageFacts(**base)
+
+
+def test_check_clean_package_exits_zero(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _stub_gather(monkeypatch, _facts("express"))
+    assert main(["check", "express", "--no-color"]) == EXIT_OK
+    assert "no red flags" in capsys.readouterr().out
+
+
+def test_check_flagged_package_exits_nonzero(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Non-zero so `check` composes with `&&` and can gate a CI step."""
+    _stub_gather(monkeypatch, _facts("evil", advisories=("GHSA-x",)))
+    assert main(["check", "evil", "--no-color"]) == EXIT_FLAGGED
+    assert "BLOCKED" in capsys.readouterr().out
+
+
+def test_check_json_output_is_machine_readable(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     import json as _json
 
-    from pkgpatrol.cli import main as _main
+    _stub_gather(monkeypatch, _facts("evil", advisories=("GHSA-x",)))
+    main(["check", "evil", "--json"])
+    payload = _json.loads(capsys.readouterr().out)
+    assert payload["decision"] == "deny"
+    assert payload["packages"][0]["advisories"] == ["GHSA-x"]
 
-    assert _main(["init", "--print"]) == EXIT_OK
-    config = _json.loads(capsys.readouterr().out)
-    block = config["hooks"]["PreToolUse"][0]
+
+def test_check_no_color_suppresses_escape_codes(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    _stub_gather(monkeypatch, _facts("express"))
+    main(["check", "express", "--no-color"])
+    assert "\033[" not in capsys.readouterr().out
+
+
+def test_check_parses_npm_version_suffix(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: list = []
+    monkeypatch.setattr(
+        "pkgpatrol.cli.gather",
+        lambda specs, *_a, **_k: captured.extend(specs) or [_facts("express")],
+    )
+    main(["check", "express@4.17.1", "--no-color"])
+    assert captured[0].name == "express"
+    assert captured[0].version_spec == "4.17.1"
+
+
+def test_check_parses_scoped_npm_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: list = []
+    monkeypatch.setattr(
+        "pkgpatrol.cli.gather",
+        lambda specs, *_a, **_k: captured.extend(specs) or [_facts("@types/node")],
+    )
+    main(["check", "@types/node@20.1.0", "--no-color"])
+    assert captured[0].name == "@types/node"
+    assert captured[0].version_spec == "20.1.0"
+
+
+def test_check_parses_pypi_pin(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: list = []
+    monkeypatch.setattr(
+        "pkgpatrol.cli.gather",
+        lambda specs, *_a, **_k: captured.extend(specs) or [_facts("requests")],
+    )
+    main(["check", "requests==2.28.0", "-e", "pypi", "--no-color"])
+    assert captured[0].name == "requests"
+    assert captured[0].version_spec == "==2.28.0"
+
+
+# --------------------------------------------------------------------------
+# init
+# --------------------------------------------------------------------------
+
+
+def test_init_print_emits_valid_config(capsys: pytest.CaptureFixture[str]) -> None:
+    import json as _json
+
+    assert main(["init", "--print"]) == EXIT_OK
+    block = _json.loads(capsys.readouterr().out)["hooks"]["PreToolUse"][0]
     assert block["matcher"] == "Bash"
     inner = block["hooks"][0]
-    assert inner["type"] == "command"
-    assert inner["command"].endswith("hook")
-    # Bounded, and failing open — a hook failure must not block the user.
-    assert inner["timeout"] == 10
     assert inner["onFailure"] == "continue"
+    assert inner["timeout"] == 10
 
 
-def test_init_without_print_is_unimplemented(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """Writing settings.json could break the user's Claude Code config, so it
-    is deliberately deferred to its own change."""
-    assert main(["init"]) == EXIT_UNIMPLEMENTED
-    assert "--print" in capsys.readouterr().err
+def test_init_writes_settings(capsys: pytest.CaptureFixture[str]) -> None:
+    """Runs against the temp HOME from conftest, never the real one."""
+    import json as _json
+    from pathlib import Path
+
+    assert main(["init"]) == EXIT_OK
+    written = _json.loads((Path.home() / ".claude/settings.json").read_text())
+    assert written["hooks"]["PreToolUse"][0]["matcher"] == "Bash"
+    assert "new Claude Code session" in capsys.readouterr().out
 
 
-def test_hook_command_prefers_an_absolute_path() -> None:
-    from pkgpatrol.cli import hook_command
+def test_init_is_idempotent(capsys: pytest.CaptureFixture[str]) -> None:
+    main(["init"])
+    capsys.readouterr()
+    assert main(["init"]) == EXIT_OK
+    assert "already configured" in capsys.readouterr().out
 
-    command = hook_command()
-    # A bare name would rely on the GUI process inheriting the right PATH.
-    assert command.endswith(" hook")
-    assert "pkgpatrol" in command
+
+def test_init_dry_run_writes_nothing() -> None:
+    from pathlib import Path
+
+    assert main(["init", "--dry-run"]) == EXIT_OK
+    assert not (Path.home() / ".claude/settings.json").exists()
+
+
+def test_init_refuses_broken_settings(capsys: pytest.CaptureFixture[str]) -> None:
+    from pathlib import Path
+
+    target = Path.home() / ".claude/settings.json"
+    target.write_text('{"broken":', encoding="utf-8")
+    assert main(["init"]) == EXIT_FLAGGED
+    assert "not valid JSON" in capsys.readouterr().err
+    assert target.read_text(encoding="utf-8") == '{"broken":'

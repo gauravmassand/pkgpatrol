@@ -45,17 +45,31 @@ from __future__ import annotations
 
 import json
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import IO, Any
 
-from .parse import InstallCommand, parse_command
+from .analyze import DEFAULT_POLICY, Policy, Verdict
+from .analyze import decide as judge
+from .http import Deadline, HttpClient
+from .parse import InstallCommand, PackageSpec, parse_command
+from .registry import PackageFacts, gather
 
 __all__ = [
     "Decision",
     "HookInput",
     "decide",
     "run",
+    "HOOK_BUDGET_SECONDS",
 ]
+
+#: Wall-clock budget for all registry work in one hook invocation.
+#:
+#: The hook is configured with ``timeout: 10`` in settings.json. We stop at
+#: eight so there is room for interpreter start-up and for writing the answer
+#: — being killed mid-flight would produce no decision at all, which is a
+#: worse outcome than a partial one.
+HOOK_BUDGET_SECONDS = 8.0
 
 #: Permission-mode values where the user has waived per-call prompts. In these
 #: modes an `ask` decision is useless — nothing will prompt — so a genuine
@@ -199,13 +213,43 @@ def _describe(installs: list[InstallCommand]) -> str:
     return "\n".join(lines)
 
 
-def decide(payload: Any) -> Decision:
+#: How the facts for a set of packages are obtained. Injectable so tests can
+#: run the whole decision path without touching the network.
+LookupFn = Callable[[list[PackageSpec], Deadline], list[PackageFacts]]
+
+
+def _default_lookup(specs: list[PackageSpec], deadline: Deadline) -> list[PackageFacts]:
+    return gather(specs, HttpClient(), deadline)
+
+
+def _format_findings(verdict: Verdict) -> str:
+    """Render findings for the user, worst first, one package per block."""
+    blocks: list[str] = []
+    for facts, findings in verdict.results:
+        if not findings:
+            continue
+        lines = [f"{facts.display}:"]
+        lines += [
+            f"  [{finding.severity.label}] {finding.summary}" for finding in findings
+        ]
+        blocks.append("\n".join(lines))
+    return "\n".join(blocks)
+
+
+def decide(
+    payload: Any,
+    lookup: LookupFn | None = None,
+    policy: Policy = DEFAULT_POLICY,
+    deadline: Deadline | None = None,
+) -> Decision:
     """Turn a hook payload into a decision.
 
-    Pure: no I/O, no network. This is where registry lookups and red-flag
-    analysis will plug in once the registry clients exist. For now it reports
-    what it found and defers, so the hook can be installed and observed
-    without being able to block anything.
+    Parses the command, resolves each package against its registry, analyses
+    the result, and maps the verdict onto Claude Code's permission vocabulary.
+
+    Failure is always open. If the lookup raises, times out, or returns
+    nothing useful, we report what we know and step aside — an outage on our
+    side must not stop the user's install.
     """
     hook_input = HookInput.from_json(payload)
     if not hook_input.is_relevant:
@@ -215,22 +259,62 @@ def decide(payload: Any) -> Decision:
     if not installs:
         return SILENT
 
-    vettable = [spec for install in installs for spec in install.specs]
+    specs = [spec for install in installs for spec in install.specs]
     summary = _describe(installs)
 
-    # TODO(registry): resolve versions, fetch advisories, and return `deny`
-    # for known CVEs — escalating past `ask` when is_auto_approving is True.
-    note = (
-        f"pkgpatrol detected a package install:\n{summary}\n\n"
-        f"Registry checks are not implemented yet, so this install was not "
-        f"vetted."
-    )
-    if not vettable:
-        note = (
-            f"pkgpatrol detected a package install with nothing it can vet:\n{summary}"
+    if not specs:
+        # A manifest install, or only targets we cannot look up (local paths,
+        # git URLs). Say what we saw and let it through.
+        return Decision(
+            decision="defer",
+            context=f"pkgpatrol saw an install it cannot vet:\n{summary}",
         )
 
-    return Decision(decision="defer", context=note)
+    deadline = deadline or Deadline(HOOK_BUDGET_SECONDS)
+    lookup = lookup or _default_lookup
+
+    try:
+        all_facts = lookup(specs, deadline)
+    except Exception as exc:  # noqa: BLE001 - our failure must not block them
+        return Decision(
+            decision="defer",
+            context=(
+                f"pkgpatrol could not check these packages "
+                f"({type(exc).__name__}), so they were not vetted:\n{summary}"
+            ),
+        )
+
+    verdict = judge(
+        all_facts, auto_approving=hook_input.is_auto_approving, policy=policy
+    )
+    detail = _format_findings(verdict)
+
+    if verdict.decision == "deny":
+        return Decision(
+            decision="deny",
+            reason=verdict.reason,
+            context=detail,
+        )
+    if verdict.decision == "ask":
+        return Decision(
+            decision="ask",
+            reason=verdict.reason,
+            context=detail,
+        )
+
+    if detail:
+        return Decision(decision="defer", context=detail)
+
+    checked = ", ".join(facts.display for facts in all_facts if facts.ok)
+    if checked:
+        return Decision(
+            decision="defer",
+            context=f"pkgpatrol checked {checked} and found nothing of concern.",
+        )
+    return Decision(
+        decision="defer",
+        context=f"pkgpatrol could not vet these packages:\n{summary}",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -238,7 +322,11 @@ def decide(payload: Any) -> Decision:
 # ---------------------------------------------------------------------------
 
 
-def run(stdin: IO[str] | None = None, stdout: IO[str] | None = None) -> int:
+def run(
+    stdin: IO[str] | None = None,
+    stdout: IO[str] | None = None,
+    lookup: LookupFn | None = None,
+) -> int:
     """Read a payload, write a decision, and return an exit code.
 
     Always returns 0. Exit code 2 would block the tool call and exit 1 would
@@ -264,7 +352,7 @@ def run(stdin: IO[str] | None = None, stdout: IO[str] | None = None) -> int:
         return 0
 
     try:
-        decision = decide(payload)
+        decision = decide(payload, lookup=lookup)
     except Exception:  # noqa: BLE001 - a bug here must not block the user
         return 0
 
